@@ -1,0 +1,13 @@
+{
+"batch_size": 32,
+"emb_dim": 32,
+"gru_dim": 128,
+"gru_layers": 2,
+"bidirectional": true,
+"dropout_prob": 0.2,
+"target_dim": 5,
+"num_features": 3,
+"max_seq_pred": 68,
+"lr": 1e-3,
+"wd": 0.0
+}

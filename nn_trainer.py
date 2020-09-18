@@ -3,6 +3,7 @@ import json
 import os
 
 from catalyst import dl
+from catalyst.dl import utils
 from catalyst.contrib.dl.callbacks.neptune_logger import NeptuneLogger
 import numpy as np
 import pandas as pd
@@ -11,9 +12,10 @@ from sklearn.model_selection import StratifiedKFold
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+
 # from torchcontrib.optim import SWA
 
-from constants import TRAIN_JSON
+from constants import FilePaths
 from datasets import RNAData
 from modellib.RNNmodels import RNAGRUModel
 
@@ -33,7 +35,7 @@ class MCRMSE(nn.Module):
         return score
 
 
-def train_one_fold(tr, vl, hparams, logger, logdir):
+def train_one_fold(tr, vl, hparams, logger, logdir, device):
     tr_ds = RNAData(tr, targets=["reactivity", "deg_Mg_pH10", "deg_Mg_50C"])
     vl_ds = RNAData(vl, targets=["reactivity", "deg_Mg_pH10", "deg_Mg_50C"])
 
@@ -46,31 +48,32 @@ def train_one_fold(tr, vl, hparams, logger, logdir):
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True)
     criterion = MCRMSE()
-    runner = dl.SupervisedRunner()
+    runner = dl.SupervisedRunner(device=device)
     runner.train(
         loaders={"train": tr_dl, "valid": vl_dl},
-        model=model, criterion=criterion, optimizer=optimizer, scheduler=scheduler,
-        num_epochs=100, logdir=logdir, verbose=True,
+        model=model,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        num_epochs=100,
+        logdir=logdir,
+        verbose=True,
         callbacks=[logger],
         load_best_on_end=True,
     )
-    return model
+    return model, tr_dl, vl_dl
 
 
-def get_predictions(model, loader, cuda=False):
+def get_predictions(model, loader, device):
     model.eval()
-    if cuda:
-        model.cuda()
+    model.to(device)
     preds = []
     with torch.no_grad():
         for batch in loader:
             x, _ = batch
-            if cuda:
-                x = x.cuda()
-                b_preds = model(x)
-                b_preds = b_preds.cpu()
-            else:
-                b_preds = model(x)
+            x = {k: val.to(device) for k, val in x.items()}
+            b_preds = model(x)
+            b_preds = b_preds.cpu()
             b_preds = b_preds.numpy()
             preds.extend(b_preds)
     return np.array(preds)
@@ -91,25 +94,28 @@ if __name__ == "__main__":
 
     NUM_WORKERS = 8
     BATCH_SIZE = hparams.get("batch_size", 32)
-
-    train = pd.read_json(TRAIN_JSON, lines=True)
+    FP = FilePaths("data")
+    train = pd.read_json(FP.train_json, lines=True)
     train = train.loc[train["SN_filter"] == 1]
-    cvlist = list(StratifiedKFold(hparams.get("num_folds", 10), shuffle=True, random_state=hparams.get("seed", 978654)).split(train, train["SN_filter"]))
+    cvlist = list(
+        StratifiedKFold(hparams.get("num_folds", 10), shuffle=True, random_state=hparams.get("seed", 978654)).split(
+            train, train["SN_filter"]
+        )
+    )
 
     neptune_logger = NeptuneLogger(
-                    api_token=os.environ["NEPTUNE_API_TOKEN"],
-                    project_name='tezdhar/Covid-RNA-degradation',
-                    name='covid_rna_degradation',
-                    params=hparams,
-                    tags=tags,
-                    upload_source_files=['*.py', 'modellib/*.py'],
-                    )
-
+        api_token=os.environ["NEPTUNE_API_TOKEN"],
+        project_name="tezdhar/Covid-RNA-degradation",
+        name="covid_rna_degradation",
+        params=hparams,
+        tags=tags,
+        upload_source_files=["*.py", "modellib/*.py"],
+    )
+    device = utils.get_device()
     for fold_num, (tr_idx, val_idx) in enumerate(cvlist):
         tr, vl = train.iloc[tr_idx], train.iloc[val_idx]
         logdir = exp_dir / f"fold_{fold_num}"
         logdir.mkdir(exist_ok=True)
-        trained_model = train_one_fold(tr, vl, hparams, neptune_logger, logdir)
-        val_preds = get_predictions(trained_model, vl)
+        trained_model, _, vl_dl = train_one_fold(tr, vl, hparams, neptune_logger, logdir, device)
+        val_preds = get_predictions(trained_model, vl_dl, device)
         np.save(str(logdir / "val_preds.npy"), val_preds)
-        break

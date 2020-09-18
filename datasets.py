@@ -37,4 +37,4 @@ class RNAData(Dataset):
         }
         if self.targets is not None:
             return inputs, self.target_values[idx]
-        return inputs, None
+        return inputs, 0

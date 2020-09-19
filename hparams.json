@@ -1,5 +1,6 @@
 {
 "batch_size": 32,
+"num_epochs": 10,
 "seq_emb_dim": 32,
 "struct_emb_dim": 32,
 "pl_emb_dim": 64,
@@ -11,5 +12,6 @@
 "num_features": 3,
 "max_seq_pred": 68,
 "lr": 1e-3,
-"wd": 1e-4
+"wd": 1e-4,
+"filter_sn": true
 }

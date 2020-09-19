@@ -8,6 +8,7 @@ from catalyst.contrib.dl.callbacks.neptune_logger import NeptuneLogger
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import StratifiedKFold
 import torch
 from torch import nn
@@ -15,9 +16,13 @@ from torch.utils.data import DataLoader
 
 # from torchcontrib.optim import SWA
 
-from constants import FilePaths
+from constants import FilePaths, TGT_COLS
 from datasets import RNAData
 from modellib.RNNmodels import RNAGRUModel
+
+
+def mcrmse(y_true, y_pred):
+    return [mean_squared_error(y_true[:, :, i], y_pred[:, :, i], squared=False) for i in range(y_true.shape[1])]
 
 
 class MCRMSE(nn.Module):
@@ -36,8 +41,8 @@ class MCRMSE(nn.Module):
 
 
 def train_one_fold(tr, vl, hparams, logger, logdir, device):
-    tr_ds = RNAData(tr, targets=["reactivity", "deg_Mg_pH10", "deg_Mg_50C"])
-    vl_ds = RNAData(vl, targets=["reactivity", "deg_Mg_pH10", "deg_Mg_50C"])
+    tr_ds = RNAData(tr, targets=TGT_COLS)
+    vl_ds = RNAData(vl, targets=TGT_COLS)
 
     tr_dl = DataLoader(tr_ds, shuffle=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
     vl_dl = DataLoader(vl_ds, shuffle=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
@@ -55,7 +60,7 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
         criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
-        num_epochs=100,
+        num_epochs=hparams.get("num_epochs", 10),
         logdir=logdir,
         verbose=True,
         callbacks=[logger],
@@ -70,13 +75,34 @@ def get_predictions(model, loader, device):
     preds = []
     with torch.no_grad():
         for batch in loader:
-            x, _ = batch
+            x, y = batch
             x = {k: val.to(device) for k, val in x.items()}
             b_preds = model(x)
             b_preds = b_preds.cpu()
             b_preds = b_preds.numpy()
             preds.extend(b_preds)
     return np.array(preds)
+
+
+def validation_metrics(y_trues, y_preds, sn_flag):
+    results = []
+    eval_cols = TGT_COLS
+    high_snr_losses = mcrmse(y_trues[sn_flag], y_preds[sn_flag])
+    for i, loss in enumerate(high_snr_losses):
+        results[f"high_snr_{eval_cols[i]}"] = loss
+
+    low_snr_losses = mcrmse(y_trues[~sn_flag], y_preds[~sn_flag])
+    for i, loss in enumerate(low_snr_losses):
+        results[f"low_snr_{eval_cols[i]}"] = loss
+
+    losses = mcrmse(y_trues, y_preds)
+    for i, loss in enumerate(losses):
+        results[f"{eval_cols[i]}"] = loss
+
+    results["total_mcrmse"] = np.mean(losses)
+    results["high_snr_mcrmse"] = np.mean(high_snr_losses)
+    results["low_snr_mcrmse"] = np.mean(low_snr_losses)
+    return results
 
 
 if __name__ == "__main__":
@@ -96,7 +122,6 @@ if __name__ == "__main__":
     BATCH_SIZE = hparams.get("batch_size", 32)
     FP = FilePaths("data")
     train = pd.read_json(FP.train_json, lines=True)
-    train = train.loc[train["SN_filter"] == 1]
     cvlist = list(
         StratifiedKFold(hparams.get("num_folds", 10), shuffle=True, random_state=hparams.get("seed", 978654)).split(
             train, train["SN_filter"]
@@ -112,10 +137,19 @@ if __name__ == "__main__":
         upload_source_files=["*.py", "modellib/*.py"],
     )
     device = utils.get_device()
+    val_preds = np.zeros(shape=(len(train), hparams["max_seq_pred"], hparams["num_features"]), dtype='float32')
     for fold_num, (tr_idx, val_idx) in enumerate(cvlist):
         tr, vl = train.iloc[tr_idx], train.iloc[val_idx]
+        if hparams.get("filter_sn"):
+            tr = tr.loc[tr["SN_filter"] == 1]
+
         logdir = exp_dir / f"fold_{fold_num}"
         logdir.mkdir(exist_ok=True)
         trained_model, _, vl_dl = train_one_fold(tr, vl, hparams, neptune_logger, logdir, device)
-        val_preds = get_predictions(trained_model, vl_dl, device)
-        np.save(str(logdir / "val_preds.npy"), val_preds)
+        val_preds[val_idx] = get_predictions(trained_model, vl_dl, device)[:, :, : hparams["num_features"]]
+
+    y_trues = np.dstack((np.vstack(train[col].values) for col in TGT_COLS))
+    sn_flag = train["SN_filter"].values
+    eval_results = validation_metrics(y_trues, val_preds, sn_flag)
+    for eval_name, eval_value in eval_results.items():
+        neptune_logger.experiment.add_metric(eval_name, eval_value)

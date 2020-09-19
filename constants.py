@@ -14,3 +14,6 @@ class Mappings:
     structure_token2int = {s: i for i, s in enumerate("(.)")}
     sequence_token2int = {s: i for i, s in enumerate("ACGU")}
     pl_token2int = {s: i for i, s in enumerate("BEHIMSX")}
+
+
+TGT_COLS = ["reactivity", "deg_Mg_pH10", "deg_Mg_50C"]

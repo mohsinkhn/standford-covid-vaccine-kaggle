@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from constants import FilePaths, TGT_COLS
 from datasets import RNAData
-from modellib.RNNmodels import RNAGRUModel
+from modellib import RNNmodels
 
 
 def mcrmse(y_true, y_pred):
@@ -47,7 +47,7 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
     tr_dl = DataLoader(tr_ds, shuffle=True, drop_last=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
     vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
 
-    model = RNAGRUModel(hparams)
+    model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams)
     optimizer = torch.optim.Adam(model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0))
     # optimizer = SWA(base_opt, swa_start=10, swa_freq=5, swa_lr=hparams.get("lr", 1e-2))
 

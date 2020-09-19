@@ -50,7 +50,7 @@ if __name__ == "__main__":
         vl = train.iloc[val_idx]
         vl_ds = RNAData(vl, targets=TGT_COLS)
         vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
-        model = RNAGRUModel(hparams)
+        model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams)
         model.load_state_dict(torch.load(model_path / f"fold_{fold}" / "checkpoints/best.pth")["model_state_dict"])
         val_preds[val_idx] = get_predictions(model, vl_dl, device)[:, :, : hparams["num_features"]]
 

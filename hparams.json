@@ -1,17 +1,19 @@
 {
-"batch_size": 32,
-"num_epochs": 10,
-"seq_emb_dim": 32,
-"struct_emb_dim": 32,
+"batch_size": 100,
+"num_epochs": 100,
+"num_folds": 10,
+"seed": 1234786,
+"seq_emb_dim": 64,
+"struct_emb_dim": 64,
 "pl_emb_dim": 64,
 "gru_dim": 128,
 "gru_layers": 3,
 "bidirectional": true,
-"dropout_prob": 0.2,
+"dropout_prob": 0.1,
 "target_dim": 5,
 "num_features": 3,
 "max_seq_pred": 68,
 "lr": 1e-3,
 "wd": 1e-4,
-"filter_sn": true
+"filter_sn": false
 }

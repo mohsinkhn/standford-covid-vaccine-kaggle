@@ -41,8 +41,8 @@ class MCRMSE(nn.Module):
 
 
 def train_one_fold(tr, vl, hparams, logger, logdir, device):
-    tr_ds = RNAData(tr, targets=TGT_COLS, add_errors=hparams.get("add_error_noise"))
-    vl_ds = RNAData(vl, targets=TGT_COLS)
+    tr_ds = RNAData(tr, targets=TGT_COLS, add_errors=hparams.get("add_error_noise", False), add_bpp=hparams.get("add_bpp"), FP=FP)
+    vl_ds = RNAData(vl, targets=TGT_COLS, add_bpp=hparams.get("add_bpp"), FP=FP)
 
     tr_dl = DataLoader(tr_ds, shuffle=True, drop_last=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
     vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
@@ -151,7 +151,7 @@ if __name__ == "__main__":
             upload_source_files=["*.py", "modellib/*.py"],
         )
         trained_model, _, vl_dl = train_one_fold(tr, vl, hparams, neptune_logger, logdir, device)
-        vds = RNAData(train.iloc[val_idx], targets=TGT_COLS)
+        vds = RNAData(train.iloc[val_idx], targets=TGT_COLS, add_bpp=hparams.get("add_bpp"), FP=FP)
         vdl = DataLoader(vds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
         val_pred = get_predictions(trained_model, vdl, device)[:, :, : hparams["num_features"]]
         val_preds[val_idx] = val_pred

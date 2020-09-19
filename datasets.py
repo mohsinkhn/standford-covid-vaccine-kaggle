@@ -2,7 +2,7 @@
 
 import numpy as np
 from torch.utils.data import Dataset
-from constants import Mappings
+from constants import Mappings, FilePaths
 
 
 TGT2ERR_COL = {
@@ -13,10 +13,12 @@ TGT2ERR_COL = {
 
 
 class RNAData(Dataset):
-    def __init__(self, df, targets=None, add_errors=False):
+    def __init__(self, df, targets=None, add_errors=False, add_bpp=False, FP=None):
         self.df = df
         self.targets = targets
         self.add_errors = add_errors
+        self.add_bpp = add_bpp
+        self.FP = FP
         self.prepare_inputs()
 
     def prepare_inputs(self):
@@ -36,7 +38,10 @@ class RNAData(Dataset):
         
         if self.add_errors:
             self.errors_sigma = np.dstack((np.vstack(self.df[TGT2ERR_COL[col]].values) for col in self.targets)).astype(np.float32).clip(-4, 4)
-            
+        
+        if self.add_bpp:
+            self.ids = self.df["id"].values
+
     def __len__(self):
         return len(self.df)
 
@@ -53,5 +58,9 @@ class RNAData(Dataset):
 
         if self.add_errors:
             err_sig = self.errors_sigma[idx]
-            targets += np.random.randn(*err_sig.shape) * err_sig  
+            targets += np.random.randn(*err_sig.shape) * err_sig
+        
+        if self.add_bpp:
+            rna_id = self.ids[idx]
+            inputs["bpps"] = np.load(f"{self.FP.bpps_path}/{rna_id}.npy").astype('float32')
         return inputs, targets

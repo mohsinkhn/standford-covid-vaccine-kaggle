@@ -13,7 +13,7 @@ from sklearn.model_selection import StratifiedKFold
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-
+from tqdm import tqdm
 # from torchcontrib.optim import SWA
 
 from constants import FilePaths, TGT_COLS
@@ -74,7 +74,7 @@ def get_predictions(model, loader, device):
     model.to(device)
     preds = []
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader):
             x, y = batch
             x = {k: val.to(device) for k, val in x.items()}
             b_preds = model(x)

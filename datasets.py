@@ -5,10 +5,18 @@ from torch.utils.data import Dataset
 from constants import Mappings
 
 
+TGT2ERR_COL = {
+    "reactivity": "reactivity_error",
+    "deg_Mg_50C": "deg_error_Mg_50C",
+    "deg_Mg_pH10": "deg_error_Mg_pH10"
+}
+
+
 class RNAData(Dataset):
-    def __init__(self, df, targets=None):
+    def __init__(self, df, targets=None, add_errors=False):
         self.df = df
         self.targets = targets
+        self.add_errors = add_errors
         self.prepare_inputs()
 
     def prepare_inputs(self):
@@ -24,8 +32,11 @@ class RNAData(Dataset):
             .values
         )
         if self.targets is not None:
-            self.target_values = np.dstack((np.vstack(self.df[col].values) for col in self.targets)).astype(np.float32)
-
+            self.target_values = np.dstack((np.vstack(self.df[col].values) for col in self.targets)).astype(np.float32).clip(-4, 4)
+        
+        if self.add_errors:
+            self.errors_sigma = np.dstack((np.vstack(self.df[TGT2ERR_COL[col]].values) for col in self.targets)).astype(np.float32).clip(-4, 4)
+            
     def __len__(self):
         return len(self.df)
 
@@ -36,5 +47,11 @@ class RNAData(Dataset):
             "predicted_loop_type": np.array(self.predicted_loop[idx]).reshape(-1, 1),
         }
         if self.targets is not None:
-            return inputs, self.target_values[idx]
-        return inputs, 0
+            targets = self.target_values[idx]
+        else:
+            targets = [0]
+
+        if self.add_errors:
+            err_sig = self.errors_sigma[idx]
+            targets += np.random.randn(*err_sig.shape) * err_sig  
+        return inputs, targets

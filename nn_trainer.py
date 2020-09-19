@@ -41,7 +41,7 @@ class MCRMSE(nn.Module):
 
 
 def train_one_fold(tr, vl, hparams, logger, logdir, device):
-    tr_ds = RNAData(tr, targets=TGT_COLS)
+    tr_ds = RNAData(tr, targets=TGT_COLS, add_errors=hparams.get("add_error_noise"))
     vl_ds = RNAData(vl, targets=TGT_COLS)
 
     tr_dl = DataLoader(tr_ds, shuffle=True, drop_last=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
@@ -132,6 +132,7 @@ if __name__ == "__main__":
     with open(str(exp_dir / "hparams.json"), "w") as hf:
         json.dump(hparams, hf)
 
+    run_on_single = hparams.get("run_on_single", False)
     device = utils.get_device()
     val_preds = np.zeros(shape=(len(train), hparams["max_seq_pred"], hparams["num_features"]), dtype='float64')
     for fold_num, (tr_idx, val_idx) in enumerate(cvlist):
@@ -152,14 +153,24 @@ if __name__ == "__main__":
         trained_model, _, vl_dl = train_one_fold(tr, vl, hparams, neptune_logger, logdir, device)
         vds = RNAData(train.iloc[val_idx], targets=TGT_COLS)
         vdl = DataLoader(vds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
-        val_preds[val_idx] = get_predictions(trained_model, vdl, device)[:, :, : hparams["num_features"]]
+        val_pred = get_predictions(trained_model, vdl, device)[:, :, : hparams["num_features"]]
+        val_preds[val_idx] = val_pred
+
+        if run_on_single:
+            break
 
         if fold_num + 1 != len(cvlist):
             neptune_logger.experiment.stop()
 
-    y_trues = np.dstack((np.vstack(train[col].values) for col in TGT_COLS))
-    sn_flag = train["SN_filter"].values.astype(bool)
-    eval_results = validation_metrics(y_trues, val_preds, sn_flag)
+    if run_on_single:
+        y_trues = np.dstack((np.vstack(train[col].iloc[val_idx].values) for col in TGT_COLS))
+        sn_flag = train["SN_filter"].iloc[val_idx].values.astype(bool)
+        eval_results = validation_metrics(y_trues, val_pred, sn_flag)
+    else:
+        y_trues = np.dstack((np.vstack(train[col].values) for col in TGT_COLS))
+        sn_flag = train["SN_filter"].values.astype(bool)
+        eval_results = validation_metrics(y_trues, val_preds, sn_flag)
+
     for eval_name, eval_value in eval_results.items():
         neptune_logger.experiment.log_metric(eval_name, eval_value)
     neptune_logger.experiment.stop()

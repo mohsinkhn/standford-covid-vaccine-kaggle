@@ -190,6 +190,7 @@ if __name__ == "__main__":
         sn_flag = train["SN_filter"].values.astype(bool)
         eval_results = validation_metrics(y_trues, val_preds, sn_flag)
 
+    print(eval_results)
     for eval_name, eval_value in eval_results.items():
         neptune_logger.experiment.log_metric(eval_name, eval_value)
     neptune_logger.experiment.stop()

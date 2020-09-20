@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
 # from torchcontrib.optim import SWA
 
 from constants import FilePaths, TGT_COLS
@@ -41,17 +42,35 @@ class MCRMSE(nn.Module):
 
 
 def train_one_fold(tr, vl, hparams, logger, logdir, device):
-    tr_ds = RNAData(tr, targets=TGT_COLS, add_errors=hparams.get("add_error_noise", False), add_bpp=hparams.get("add_bpp"), FP=FP)
+    tr_ds = RNAData(
+        tr,
+        targets=TGT_COLS,
+        add_errors=hparams.get("add_error_noise", False),
+        add_bpp=hparams.get("add_bpp"),
+        FP=FP,
+        sig_factor=hparams.get("sig_factor", 1.0),
+    )
     vl_ds = RNAData(vl, targets=TGT_COLS, add_bpp=hparams.get("add_bpp"), FP=FP)
 
     tr_dl = DataLoader(tr_ds, shuffle=True, drop_last=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
     vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
 
     model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams)
-    optimizer = torch.optim.Adam(model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0))
+    if hparams.get("optimizer", "adam") == "adam":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=True
+        )
+    else:
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=hparams.get("lr", 1e-3),
+            weight_decay=hparams.get("wd", 0),
+            momentum=0.9,
+            nesterov=True,
+        )
     # optimizer = SWA(base_opt, swa_start=10, swa_freq=5, swa_lr=hparams.get("lr", 1e-2))
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, factor=0.2)
     criterion = MCRMSE()
     runner = dl.SupervisedRunner(device=device)
     runner.train(
@@ -134,7 +153,7 @@ if __name__ == "__main__":
 
     run_on_single = hparams.get("run_on_single", False)
     device = utils.get_device()
-    val_preds = np.zeros(shape=(len(train), hparams["max_seq_pred"], hparams["num_features"]), dtype='float64')
+    val_preds = np.zeros(shape=(len(train), hparams["max_seq_pred"], hparams["num_features"]), dtype="float64")
     for fold_num, (tr_idx, val_idx) in enumerate(cvlist):
         tr, vl = train.iloc[tr_idx], train.iloc[val_idx]
         if hparams.get("filter_sn"):
@@ -147,7 +166,7 @@ if __name__ == "__main__":
             project_name="tezdhar/Covid-RNA-degradation",
             name="covid_rna_degradation",
             params=hparams,
-            tags=tags+[f"fold_{fold_num}"],
+            tags=tags + [f"fold_{fold_num}"],
             upload_source_files=["*.py", "modellib/*.py"],
         )
         trained_model, _, vl_dl = train_one_fold(tr, vl, hparams, neptune_logger, logdir, device)

@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 from constants import FilePaths, TGT_COLS
 from datasets import RNAData
-from modellib.RNNmodels import RNAGRUModel
+from modellib import RNNmodels
 from nn_trainer import get_predictions, validation_metrics
 
 
@@ -44,7 +44,7 @@ if __name__ == "__main__":
     )
 
     device = utils.get_device()
-    val_preds = np.zeros(shape=(len(train), hparams["max_seq_pred"], hparams["num_features"]), dtype='float64')
+    val_preds = np.zeros(shape=(len(train), hparams["max_seq_pred"], hparams["num_features"]), dtype="float64")
     for fold in folds:
         val_idx = cvlist[fold][1]
         vl = train.iloc[val_idx]

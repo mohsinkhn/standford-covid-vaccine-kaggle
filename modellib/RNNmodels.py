@@ -92,6 +92,7 @@ class ParamModel(nn.Module):
         self.add_bpp = self.hparams.get("add_bpp", True)
         self.rnn_type = self.hparams.get("rnn_type", "gru")
         self.conv_drop = self.hparams.get("conv_drop", 0.3)
+        self.prob_thresh = self.hparams.get("prob_thresh", 0.5)
 
 
 class RNAGRUModel(ParamModel):
@@ -281,7 +282,7 @@ class RCNNGRUModelv2(ParamModel):
 
         xbpp_prob, xbpp_idx = xinputs["bpps"].max(dim=1)
         xbpp_sum = xinputs["bpps"].mean(dim=1)
-        mask = xbpp_prob < self.bpp_thresh
+        mask = xbpp_prob < self.prob_thresh
 
         p_xseq = xinputs["sequence"].gather(1, xbpp_idx)
         p_xseq_ = p_xseq.masked_fill(mask, 0)

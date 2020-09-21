@@ -16,23 +16,23 @@ def onehot(sequence, num_tokens):
 
 
 class Conv1dBn(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=5, stride=1, padding=2):
+    def __init__(self, in_channels, out_channels, kernel_size=5, stride=1, padding=2, drop=0.1):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
         self.bnorm1 = nn.BatchNorm1d(out_channels)
         self.gelu = nn.GELU()
-        self.drop = nn.Dropout2d(0.1)
+        self.drop = nn.Dropout2d(drop)
 
     def forward(self, x):
         return self.drop(self.gelu(self.bnorm1(self.conv1(x))))
 
 
 class Conv1dBnStack(nn.Module):
-    def __init__(self, in_channels, conv_channels, kernel_size=5, stride=1, padding=2):
+    def __init__(self, in_channels, conv_channels, kernel_size=5, stride=1, padding=2, drop=0.2):
         super().__init__()
-        conv_layers = []
+        self.conv_layers = []
         self.conv_channels = conv_channels
         for i in range(len(self.conv_channels)):
             if i == 0:
@@ -41,6 +41,7 @@ class Conv1dBnStack(nn.Module):
                     out_channels=self.conv_channels[i],
                     stride=stride,
                     kernel_size=kernel_size,
+                    drop=0.2
                 )
             else:
                 layer = Conv1dBn(
@@ -48,12 +49,16 @@ class Conv1dBnStack(nn.Module):
                     out_channels=self.conv_channels[i],
                     stride=stride,
                     kernel_size=kernel_size,
+                    drop=0.2
                 )
-            conv_layers.append(layer)
-        self.conv = nn.Sequential(*conv_layers)
+            self.conv_layers.append(layer)
+        self.conv = nn.Sequential(*self.conv_layers)
 
     def forward(self, x):
         x = x.permute(0, 2, 1).contiguous()
+        # x = self.conv_layers[0](x)
+        # if len(self.conv_layers) > 1:
+        #    x += self.
         x = self.conv(x)
         return x.permute(0, 2, 1).contiguous()
 
@@ -86,6 +91,7 @@ class ParamModel(nn.Module):
         self.use_one_hot = self.hparams.get("use_one_hot", False)
         self.add_bpp = self.hparams.get("add_bpp", True)
         self.rnn_type = self.hparams.get("rnn_type", "gru")
+        self.conv_drop = self.hparams.get("conv_drop", 0.3)
 
 
 class RNAGRUModel(ParamModel):
@@ -140,6 +146,7 @@ class RCNNGRUModel(ParamModel):
                     out_channels=self.conv_channels[i],
                     stride=self.stride,
                     kernel_size=self.kernel_size,
+                    drop=self.conv_drop
                 )
             else:
                 layer = Conv1dBn(
@@ -147,6 +154,7 @@ class RCNNGRUModel(ParamModel):
                     out_channels=self.conv_channels[i],
                     stride=self.stride,
                     kernel_size=self.kernel_size,
+                    drop=self.conv_drop
                 )
             conv_layers.append(layer)
         self.conv = nn.Sequential(*conv_layers)
@@ -226,19 +234,27 @@ class RCNNGRUModelv2(ParamModel):
             self.seq_conv = Conv1dBnStack(self.num_seq_tokens, self.conv_channels)
             self.struct_conv = Conv1dBnStack(self.num_struct_tokens, self.conv_channels)
             self.pl_conv = Conv1dBnStack(self.num_pl_tokens, self.conv_channels)
+            self.seq_conv2 = Conv1dBnStack(self.num_seq_tokens, self.conv_channels)
+            self.struct_conv2 = Conv1dBnStack(self.num_struct_tokens, self.conv_channels)
+            self.pl_conv2 = Conv1dBnStack(self.num_pl_tokens, self.conv_channels)
+
         else:
             self.seq_conv = Conv1dBnStack(self.seq_emb_dim, self.conv_channels)
             self.struct_conv = Conv1dBnStack(self.struct_emb_dim, self.conv_channels)
             self.pl_conv = Conv1dBnStack(self.pl_emb_dim, self.conv_channels)
+            self.seq_conv2 = Conv1dBnStack(self.seq_emb_dim, self.conv_channels)
+            self.struct_conv2 = Conv1dBnStack(self.struct_emb_dim, self.conv_channels)
+            self.pl_conv2 = Conv1dBnStack(self.pl_emb_dim, self.conv_channels)
         
-        self.cont_fc = nn.Sequential(nn.Linear(4, self.conv_channels[-1]), nn.ReLU())
+        self.cont_bnorm = nn.BatchNorm1d(4)
+        self.cont_fc = nn.Sequential(nn.Linear(4, 64), nn.ReLU())
 
         if self.rnn_type == "gru":
             rnn_layer = nn.GRU
         else:
             rnn_layer = nn.LSTM
         self.gru = rnn_layer(
-            input_size=self.conv_channels[-1] * 7,
+            input_size=self.conv_channels[-1] * 6 + 64,
             hidden_size=self.gru_dim,
             bidirectional=self.bidirectional,
             batch_first=True,
@@ -288,6 +304,9 @@ class RCNNGRUModelv2(ParamModel):
         cos_pos.masked_fill_(mask, 0)
 
         cont_emb = torch.cat([xbpp_prob.unsqueeze(2), xbpp_sum.unsqueeze(2), sin_pos.unsqueeze(2), cos_pos.unsqueeze(2)], dim=-1)
+        cont_emb = cont_emb.permute(0, 2, 1).contiguous()
+        cont_emb = self.cont_bnorm(cont_emb)
+        cont_emb = cont_emb.permute(0, 2, 1).contiguous()
         cont_emb = self.cont_fc(cont_emb)
 
         if self.use_one_hot:
@@ -299,9 +318,9 @@ class RCNNGRUModelv2(ParamModel):
             p_xstruct_emb = self.structure_embedding(p_xstruct_)
             p_xpl_emb = self.predicted_loop_embedding(p_xpl_)
         
-        p_xseq_emb = self.seq_conv(p_xseq_emb)
-        p_xstruct_emb = self.struct_conv(p_xstruct_emb)
-        p_xpl_emb = self.pl_conv(p_xpl_emb)
+        p_xseq_emb = self.seq_conv2(p_xseq_emb)
+        p_xstruct_emb = self.struct_conv2(p_xstruct_emb)
+        p_xpl_emb = self.pl_conv2(p_xpl_emb)
 
         x = torch.cat([xseq, xstruct, xpl, p_xseq_emb, p_xstruct_emb, p_xpl_emb, cont_emb], dim=-1)
         x, _ = self.gru(x)

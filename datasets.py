@@ -30,14 +30,14 @@ class RNAData(Dataset):
         )
         if self.targets is not None:
             self.target_values = (
-                np.dstack((np.vstack(self.df[col].values) for col in self.targets)).astype(np.float32).clip(-4, 4)
+                np.dstack((np.vstack(self.df[col].values) for col in self.targets)).astype(np.float32).clip(-4, 20)
             )
 
         if self.add_errors:
             self.errors_sigma = (
                 np.dstack((np.vstack(self.df[TGT2ERR_COL[col]].values) for col in self.targets))
                 .astype(np.float32)
-                .clip(-2, 2)
+                .clip(-2, 1)
             )
 
         if self.add_bpp:

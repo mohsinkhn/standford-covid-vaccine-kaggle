@@ -4,7 +4,9 @@ import os
 
 from catalyst import dl
 from catalyst.dl import utils
+from catalyst.core.callbacks.scheduler import SchedulerCallback
 from catalyst.contrib.dl.callbacks.neptune_logger import NeptuneLogger
+from catalyst.contrib.nn.schedulers.onecycle import OneCycleLRWithWarmup
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -58,7 +60,7 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
     model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams)
     if hparams.get("optimizer", "adam") == "adam":
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=True
+            model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=False
         )
     else:
         optimizer = torch.optim.SGD(
@@ -69,8 +71,15 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
             nesterov=True,
         )
     # optimizer = SWA(base_opt, swa_start=10, swa_freq=5, swa_lr=hparams.get("lr", 1e-2))
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, factor=0.2)
+    if hparams.get("scheduler", "reducelrplateau") == "reducelrplateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, factor=0.2)
+    if hparams.get("scheduler", "reducelrplateau") == "one_cycle":
+        total_steps = hparams.get("num_epochs") * (len(tr) // hparams.get("batch_size"))
+        max_lr = hparams.get("lr", 1e-3)
+        scheduler = OneCycleLRWithWarmup(optimizer,
+                                         num_steps=total_steps,
+                                         lr_range=(max_lr, max_lr/10, max_lr/100),
+                                         warmup_fraction=0.5)
     criterion = MCRMSE()
     runner = dl.SupervisedRunner(device=device)
     runner.train(
@@ -82,7 +91,7 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
         num_epochs=hparams.get("num_epochs", 10),
         logdir=logdir,
         verbose=True,
-        callbacks=[logger],
+        callbacks=[logger, SchedulerCallback(mode="epoch")],
         load_best_on_end=True,
     )
     return model, tr_dl, vl_dl
@@ -157,8 +166,8 @@ if __name__ == "__main__":
     for fold_num, (tr_idx, val_idx) in enumerate(cvlist):
         tr, vl = train.iloc[tr_idx], train.iloc[val_idx]
         if hparams.get("filter_sn"):
-            tr = tr.loc[tr["SN_filter"] == 1]
-            vl = vl.loc[vl["SN_filter"] == 1]
+            tr = tr.loc[tr["signal_to_noise"] > 0.8]
+            vl = vl.loc[vl["signal_to_noise"] > 0.8]
         logdir = exp_dir / f"fold_{fold_num}"
         logdir.mkdir(exist_ok=True)
         neptune_logger = NeptuneLogger(

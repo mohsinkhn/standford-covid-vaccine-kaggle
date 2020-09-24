@@ -20,7 +20,7 @@ from tqdm import tqdm
 # from torchcontrib.optim import SWA
 
 from constants import FilePaths, TGT_COLS
-from datasets import RNAData
+from datasets import RNAAugData
 from modellib import RNNmodels
 
 
@@ -31,36 +31,41 @@ def mcrmse(y_true, y_pred):
 class MCRMSE(nn.Module):
     def __init__(self, num_scored=3, eps=1e-8):
         super().__init__()
-        self.mse = nn.MSELoss()
+        self.mse = nn.MSELoss(reduce=None)
         self.num_scored = num_scored
         self.eps = eps
 
     def forward(self, outputs, targets):
         score = 0
         for idx in range(self.num_scored):
-            score += torch.sqrt(self.mse(outputs[:, :, idx], targets[:, :, idx]) + self.eps) / self.num_scored
+            # weights = targets[:, :, -1]
+            # col_mse = torch.sum(weights * self.mse(outputs[:, :, idx], targets[:, :, idx]))/torch.sum(weights)
+            col_mse = torch.mean(
+                self.mse(outputs[:, :, idx], targets[:, :, idx])
+            )
+            score += torch.sqrt(col_mse + self.eps) / self.num_scored
 
         return score
 
 
 def train_one_fold(tr, vl, hparams, logger, logdir, device):
-    tr_ds = RNAData(
+    tr_ds = RNAAugData(
         tr,
         targets=TGT_COLS,
-        add_errors=hparams.get("add_error_noise", False),
-        add_bpp=hparams.get("add_bpp"),
-        FP=FP,
-        sig_factor=hparams.get("sig_factor", 1.0),
+        augment_strucures=hparams.get("use_augment", False),
+        aug_data_sources=["data/augmented_data_public/aug_data5.csv", "data/augmented_data_public/aug_data5_10.csv"],
+        target_aug=False,
+        bpps_path="data/bpps",
     )
-    vl_ds = RNAData(vl, targets=TGT_COLS, add_bpp=hparams.get("add_bpp"), FP=FP)
+    vl_ds = RNAAugData(vl, targets=TGT_COLS, bpps_path="data/bpps")
 
-    tr_dl = DataLoader(tr_ds, shuffle=True, drop_last=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
-    vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
+    tr_dl = DataLoader(tr_ds, shuffle=True, drop_last=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,)
+    vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,)
 
     model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams)
     if hparams.get("optimizer", "adam") == "adam":
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=False
+            model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=False,
         )
     else:
         optimizer = torch.optim.SGD(
@@ -70,16 +75,14 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
             momentum=0.9,
             nesterov=True,
         )
-    # optimizer = SWA(base_opt, swa_start=10, swa_freq=5, swa_lr=hparams.get("lr", 1e-2))
     if hparams.get("scheduler", "reducelrplateau") == "reducelrplateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, factor=0.2)
     if hparams.get("scheduler", "reducelrplateau") == "one_cycle":
         total_steps = hparams.get("num_epochs") * (len(tr) // hparams.get("batch_size"))
         max_lr = hparams.get("lr", 1e-3)
-        scheduler = OneCycleLRWithWarmup(optimizer,
-                                         num_steps=total_steps,
-                                         lr_range=(max_lr, max_lr/10, max_lr/100),
-                                         warmup_fraction=0.5)
+        scheduler = OneCycleLRWithWarmup(
+            optimizer, num_steps=total_steps, lr_range=(max_lr, max_lr / 10, max_lr / 100), warmup_fraction=0.5,
+        )
     criterion = MCRMSE()
     runner = dl.SupervisedRunner(device=device)
     runner.train(
@@ -162,12 +165,12 @@ if __name__ == "__main__":
 
     run_on_single = hparams.get("run_on_single", False)
     device = utils.get_device()
-    val_preds = np.zeros(shape=(len(train), hparams["max_seq_pred"], hparams["num_features"]), dtype="float64")
+    val_preds = np.zeros(shape=(len(train), hparams["max_seq_pred"], hparams["num_features"]), dtype="float64",)
     for fold_num, (tr_idx, val_idx) in enumerate(cvlist):
         tr, vl = train.iloc[tr_idx], train.iloc[val_idx]
         if hparams.get("filter_sn"):
-            tr = tr.loc[tr["signal_to_noise"] > 0.8]
-            vl = vl.loc[vl["signal_to_noise"] > 0.8]
+            tr = tr.loc[tr["signal_to_noise"] > hparams.get("signal_to_noise", 1.0)]
+            vl = vl.loc[vl["signal_to_noise"] > hparams.get("signal_to_noise", 1.0)]
         logdir = exp_dir / f"fold_{fold_num}"
         logdir.mkdir(exist_ok=True)
         neptune_logger = NeptuneLogger(
@@ -179,8 +182,8 @@ if __name__ == "__main__":
             upload_source_files=["*.py", "modellib/*.py"],
         )
         trained_model, _, vl_dl = train_one_fold(tr, vl, hparams, neptune_logger, logdir, device)
-        vds = RNAData(train.iloc[val_idx], targets=TGT_COLS, add_bpp=hparams.get("add_bpp"), FP=FP)
-        vdl = DataLoader(vds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
+        vds = RNAAugData(train.iloc[val_idx], targets=TGT_COLS, bpps_path="data/bpps")
+        vdl = DataLoader(vds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,)
         val_pred = get_predictions(trained_model, vdl, device)[:, :, : hparams["num_features"]]
         val_preds[val_idx] = val_pred
 

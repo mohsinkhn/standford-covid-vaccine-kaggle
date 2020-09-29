@@ -1,10 +1,13 @@
 """RNN based models."""
 
 import math
+from gensim.models import KeyedVectors
+import numpy as np
 import torch
 from torch import nn
 
 from constants import Mappings
+from modellib.transformermodels import TransformerCustomEncoder, PositionalEncoding
 
 
 def onehot(sequence, num_tokens):
@@ -15,23 +18,16 @@ def onehot(sequence, num_tokens):
     return y_onehot
 
 
-class PositionalEncoding(nn.Module):
-
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
-
+class SpatialDropout(nn.Module):
+    def __init__(self, dropout=0.2):
+        super().__init__()
+        self.drop = nn.Dropout2d(p=dropout)
+    
     def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
-        return self.dropout(x)
+        x = x.permute(0, 2, 1).contiguous()
+        x = self.drop(x)
+        x = x.permute(0, 2, 1).contiguous()
+        return x
 
 
 class Conv1dBn(nn.Module):
@@ -49,7 +45,7 @@ class Conv1dBn(nn.Module):
 
 
 class Conv2dBn(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=7, stride=1, padding=3, drop=0.1):
+    def __init__(self, in_channels, out_channels, kernel_size=5, stride=1, padding=2, drop=0.1):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -140,6 +136,8 @@ class ParamModel(nn.Module):
         self.prob_thresh = self.hparams.get("prob_thresh", 0.5)
         self.use_codon = self.hparams.get("use_codon", False)
         self.pos_dim = self.hparams.get("pos_dim", 128)
+        self.intermediate_dim = self.hparams.get("intermediate_dim", 256)
+        self.combined_emb_dim = self.hparams.get("combined_emb_dim", 150)
 
 
 class RNAGRUModel(ParamModel):
@@ -192,7 +190,7 @@ class RCNNGRUModelv3(ParamModel):
 
         self.cont_bnorm = nn.BatchNorm1d(2)
         self.cont_fc = nn.Sequential(nn.Linear(2, 64), nn.ReLU())
-        bpp_conv_channels = [1] + self.bpp_conv_channels
+        bpp_conv_channels = [15] + self.bpp_conv_channels
         self.bpp_conv = nn.Sequential(*[Conv2dBn(bpp_conv_channels[i], bpp_conv_channels[i+1])
                                        for i in range(len(bpp_conv_channels)-1)])
         if self.rnn_type == "gru":
@@ -200,7 +198,7 @@ class RCNNGRUModelv3(ParamModel):
         else:
             rnn_layer = nn.LSTM
         self.gru = rnn_layer(
-            input_size=self.conv_channels[-1] * 2 + self.bpp_conv_channels[-1] * 2,
+            input_size=self.conv_channels[-1] * 3 + self.bpp_conv_channels[-1] * 2,
             hidden_size=self.gru_dim,
             bidirectional=self.bidirectional,
             batch_first=True,
@@ -228,19 +226,247 @@ class RCNNGRUModelv3(ParamModel):
 
         bs, seq_len = xseq.size()[:2]
 
-        xbpp = self.bpp_conv(xinputs["bpps"].unsqueeze(1))
+        xbpp = self.bpp_conv(xinputs["bpps"].permute(0, 3, 1, 2).contiguous())
         xbpp_mean = nn.AdaptiveAvgPool2d((seq_len, 1))(xbpp).squeeze(3).permute(0, 2, 1).contiguous()
         xbpp_max = nn.AdaptiveMaxPool2d((seq_len, 1))(xbpp).squeeze(3).permute(0, 2, 1).contiguous()
-        # xseq = xseq  + xseq * xbpp_mean
+        xseqpl = xseq * xpl * xbpp_mean
         # xpl = xpl + xpl * xbpp_mean
         cont_emb = torch.cat([xbpp_mean, xbpp_max], dim=-1)
         # pos = torch.zeros(bs, seq_len, self.pos_dim, device=xseq.device)
         # pos = self.pos(pos)
-        x = torch.cat([xseq, xpl, cont_emb], dim=-1)
+        x = torch.cat([xseq, xpl, xseqpl, cont_emb], dim=-1)
         x, _ = self.gru(x)
+        # x = torch.cat([x, cont_emb], dim=-1)
         x = x[:, : self.max_seq_pred, :]
         x = x.permute(0, 2, 1).contiguous()
         x = self.drop(x)
         x = x.permute(0, 2, 1).contiguous()
+        x = self.fc(x)
+        return x
+
+
+class RCNNGRUModelv4(ParamModel):
+    def __init__(self, hparams):
+        super().__init__(hparams)
+        self.hparams = hparams
+        self.sequence_embedding = nn.Embedding(self.num_seq_tokens, self.seq_emb_dim)
+        self.structure_embedding = nn.Embedding(self.num_struct_tokens, self.struct_emb_dim)
+        self.predicted_loop_embedding = nn.Embedding(self.num_pl_tokens, self.pl_emb_dim)
+        # self.combined_embedding = nn.Embedding(self.num_seq_tokens+self.num_struct_tokens+self.num_pl_tokens, self.combined_emb_dim)
+        if self.use_one_hot:
+            self.seq_conv = Conv1dBnStack(self.num_seq_tokens * 2, self.conv_channels)
+            self.struct_pl_conv = Conv1dBnStack(self.num_struct_tokens + self.num_pl_tokens, self.conv_channels)
+
+        else:
+            self.seq_conv = Conv1dBnStack(self.seq_emb_dim * 2, self.conv_channels)
+            self.struct_pl_conv = Conv1dBnStack(self.struct_emb_dim + self.pl_emb_dim, self.conv_channels)
+
+        self.cont_bnorm = nn.BatchNorm1d(2)
+        self.cont_fc = nn.Sequential(nn.Linear(2, 64), nn.ReLU())
+        bpp_conv_channels = [15] + self.bpp_conv_channels
+        self.bpp_bnorm = nn.BatchNorm2d(15)
+        self.bpp_conv = nn.Sequential(*[Conv2dBn(bpp_conv_channels[i], bpp_conv_channels[i+1])
+                                       for i in range(len(bpp_conv_channels)-1)])
+        # self.bpp_attn = nn.Sequential(
+        #     nn.Conv2d(bpp_conv_channels[-1], 1, kernel_size=1, stride=1, padding=0),
+        #     nn.BatchNorm2d(1),
+        #     nn.Tanh()
+        # )
+        # self.struc_attn = nn.Sequential(
+        #     nn.Conv1d(self.conv_channels[-1], 1, kernel_size=1, stride=1, padding=0),
+        #     nn.BatchNorm1d(1),
+        #     nn.Tanh()
+        # )
+
+        if self.rnn_type == "gru":
+            rnn_layer = nn.GRU
+        else:
+            rnn_layer = nn.LSTM
+        self.gru = rnn_layer(
+            input_size=self.conv_channels[-1] * 3 + self.bpp_conv_channels[-1] * 2 + 1,
+            hidden_size=self.gru_dim,
+            bidirectional=self.bidirectional,
+            batch_first=True,
+            num_layers=self.gru_layers,
+            dropout=self.dropout_prob,
+        )
+
+        # self.pos = PositionalEncoding(self.pos_dim)
+        self.drop = SpatialDropout(self.spatial_dropout)
+        self.drop2 = SpatialDropout(0.1)
+        # self.fc1 = nn.Sequential(, self.intermediate_dim))
+        self.fc = nn.Linear(self.gru_dim * (1 + self.bidirectional), self.target_dim)
+        # nn.init.kaiming_uniform_(self.fc.weight)
+
+    def forward(self, xinputs):
+        if self.use_one_hot:
+            xseq = onehot(xinputs["sequence"], self.num_seq_tokens)
+            xstruct = onehot(xinputs["structure"], self.num_struct_tokens)
+            xpl = onehot(xinputs["predicted_loop_type"], self.num_pl_tokens)
+            xpairseq = onehot(xinputs["pair_sequence"], self.num_seq_tokens)
+        else:
+            xseq = self.sequence_embedding(xinputs["sequence"])
+            xstruct = self.structure_embedding(xinputs["structure"])
+            xpl = self.predicted_loop_embedding(xinputs["predicted_loop_type"])
+            xpairseq = self.sequence_embedding(xinputs["pair_sequence"])
+
+        xseq = self.seq_conv(torch.cat([xseq, xpairseq], dim=-1))
+        xpl = self.struct_pl_conv(torch.cat([xpl, xstruct], dim=-1))
+
+        bs, seq_len = xseq.size()[:2]
+        xbpp_inp = xinputs["bpps"].permute(0, 3, 1, 2).contiguous()
+        xbpp = self.bpp_conv(xbpp_inp)
+        xbpp_mean = nn.AdaptiveAvgPool2d((seq_len, 1))(xbpp).squeeze(3).permute(0, 2, 1).contiguous()
+        xbpp_max = nn.AdaptiveMaxPool2d((seq_len, 1))(xbpp).squeeze(3).permute(0, 2, 1).contiguous()
+        # xseqpl = xseq * nn.Tanh()(xpl)
+        xseqbpp = torch.matmul(xbpp, xseq.unsqueeze(1)).mean(1)
+        # xpl = xpl + xpl * xbpp_mean
+        cont_emb = torch.cat([xbpp_mean, xbpp_max, xbpp_inp.mean(dim=(1, 2)).unsqueeze(2)], dim=-1)
+        # pos = torch.zeros(bs, seq_len, self.pos_dim, device=xseq.device)
+        # pos = self.pos(pos)
+        x = torch.cat([xseq, xpl, cont_emb, xseqbpp], dim=-1)
+        x, _ = self.gru(x)
+        # x = torch.cat([x, xbpp_inp.mean(dim=(1, 3)).unsqueeze(2)], dim=-1)
+        x = x[:, : self.max_seq_pred, :]
+        x = self.drop(x)
+        # x = nn.GELU()(self.fc1(x))
+        # x = self.drop2(x)
+        x = self.fc(x)
+        return x
+
+
+class RCNNGRUModelv5(ParamModel):
+    def __init__(self, hparams):
+        super().__init__(hparams)
+        self.hparams = hparams
+        self.sequence_embedding = nn.Embedding(self.num_seq_tokens, self.seq_emb_dim)
+        self.structure_embedding = nn.Embedding(self.num_struct_tokens, self.struct_emb_dim)
+        self.predicted_loop_embedding = nn.Embedding(self.num_pl_tokens, self.pl_emb_dim)
+        if self.use_one_hot:
+            self.seq_conv = Conv1dBnStack(self.num_seq_tokens * 2, self.conv_channels)
+        else:
+            self.seq_conv = Conv1dBnStack(self.seq_emb_dim * 2 + self.struct_emb_dim + self.pl_emb_dim, self.conv_channels)
+
+        self.cont_bnorm = nn.BatchNorm1d(2)
+        self.cont_fc = nn.Sequential(nn.Linear(2, 64), nn.ReLU())
+        bpp_conv_channels = [15] + self.bpp_conv_channels
+        self.bpp_bnorm = nn.BatchNorm2d(15)
+        self.bpp_conv = nn.Sequential(*[Conv2dBn(bpp_conv_channels[i], bpp_conv_channels[i+1])
+                                       for i in range(len(bpp_conv_channels)-1)])
+
+        if self.rnn_type == "gru":
+            rnn_layer = nn.GRU
+        else:
+            rnn_layer = nn.LSTM
+        self.gru = rnn_layer(
+            input_size=self.conv_channels[-1] * 2 + self.bpp_conv_channels[-1] * 2 + 1,
+            hidden_size=self.gru_dim,
+            bidirectional=self.bidirectional,
+            batch_first=True,
+            num_layers=self.gru_layers,
+            dropout=self.dropout_prob,
+        )
+        self.drop = SpatialDropout(self.spatial_dropout)
+        self.fc = nn.Linear(self.gru_dim * (1 + self.bidirectional), self.target_dim)
+
+    def forward(self, xinputs):
+        if self.use_one_hot:
+            xseq = onehot(xinputs["sequence"], self.num_seq_tokens)
+            xstruct = onehot(xinputs["structure"], self.num_struct_tokens)
+            xpl = onehot(xinputs["predicted_loop_type"], self.num_pl_tokens)
+            xpairseq = onehot(xinputs["pair_sequence"], self.num_seq_tokens)
+        else:
+            xseq = self.sequence_embedding(xinputs["sequence"])
+            xstruct = self.structure_embedding(xinputs["structure"])
+            xpl = self.predicted_loop_embedding(xinputs["predicted_loop_type"])
+            xpairseq = self.sequence_embedding(xinputs["pair_sequence"])
+
+        xseq = self.seq_conv(torch.cat([xseq, xpairseq, xpl, xstruct], dim=-1))
+        bs, seq_len = xseq.size()[:2]
+        xbpp_inp = xinputs["bpps"].permute(0, 3, 1, 2).contiguous()
+        xbpp = self.bpp_conv(xbpp_inp)
+        xbpp_mean = nn.AdaptiveAvgPool2d((seq_len, 1))(xbpp).squeeze(3).permute(0, 2, 1).contiguous()
+        xbpp_max = nn.AdaptiveMaxPool2d((seq_len, 1))(xbpp).squeeze(3).permute(0, 2, 1).contiguous()
+        #xbpp_pair = xbpp_mean.gather(xinputs["pair_sequence"], 1)
+        xseqbpp = torch.matmul(xbpp, xseq.unsqueeze(1)).mean(1)
+        cont_emb = torch.cat([xbpp_mean, xbpp_max, xbpp_inp.mean(dim=(1, 2)).unsqueeze(2)], dim=-1)
+        x = torch.cat([xseq, xseqbpp, cont_emb], dim=-1)
+        x, _ = self.gru(x)
+        x = x[:, : self.max_seq_pred, :]
+        x = self.drop(x)
+        x = self.fc(x)
+        return x
+
+
+class RCNNGRUModelv6(ParamModel):
+    def __init__(self, hparams):
+        super().__init__(hparams)
+        self.hparams = hparams
+        self.sequence_embedding = nn.Embedding(self.num_seq_tokens, self.seq_emb_dim)
+        #w2v_model = KeyedVectors.load("data/w2v_seq_6gram.vectors")
+        #embeddings = [np.zeros(shape=(32,))] + [w2v_model.wv[str(i)] for i in range(len(w2v_model.vocab))]
+        #embeddings = torch.from_numpy(np.vstack(embeddings).astype('float32'))
+        #self.sequence_embedding.weight = nn.Parameter(embeddings/8)
+
+        self.structure_embedding = nn.Embedding(self.num_struct_tokens, self.struct_emb_dim)
+        self.predicted_loop_embedding = nn.Embedding(self.num_pl_tokens, self.pl_emb_dim)
+        if self.use_one_hot:
+            self.seq_conv = Conv1dBnStack(self.num_seq_tokens * 2, self.conv_channels)
+        else:
+            self.seq_conv = Conv1dBnStack(self.seq_emb_dim * 2 + self.struct_emb_dim + self.pl_emb_dim, self.conv_channels)
+
+        self.cont_bnorm = nn.BatchNorm1d(2)
+        self.cont_fc = nn.Sequential(nn.Linear(2, 64), nn.ReLU())
+        bpp_conv_channels = [15] + self.bpp_conv_channels
+        self.bpp_bnorm = nn.BatchNorm2d(15)
+        self.bpp_conv = nn.Sequential(*[Conv2dBn(bpp_conv_channels[i], bpp_conv_channels[i+1])
+                                       for i in range(len(bpp_conv_channels)-1)])
+        self.pos = PositionalEncoding(32)
+        # self.embed_norm = nn.LayerNorm(300)
+        if self.rnn_type == "gru":
+            rnn_layer = nn.GRU
+        else:
+            rnn_layer = nn.LSTM
+        
+        self.transformer = TransformerCustomEncoder(1, self.conv_channels[-1], 512, bpp_conv_channels[0], [1], 0.1, 0.1)
+        self.gru = rnn_layer(
+            input_size=self.conv_channels[-1] * 2 + self.bpp_conv_channels[-1] * 2 + 32,
+            hidden_size=self.gru_dim,
+            bidirectional=self.bidirectional,
+            batch_first=True,
+            num_layers=self.gru_layers,
+            dropout=self.dropout_prob,
+        )
+        self.drop = nn.Dropout(self.spatial_dropout)
+        self.drop2 = nn.Dropout(0.5)
+        self.fc = nn.Linear(self.gru_dim * (1 + self.bidirectional), self.target_dim)
+
+    def forward(self, xinputs):
+        if self.use_one_hot:
+            xseq = onehot(xinputs["sequence"], self.num_seq_tokens)
+            xstruct = onehot(xinputs["structure"], self.num_struct_tokens)
+            xpl = onehot(xinputs["predicted_loop_type"], self.num_pl_tokens)
+            xpairseq = onehot(xinputs["pair_sequence"], self.num_seq_tokens)
+        else:
+            xseq = self.sequence_embedding(xinputs["sequence"])
+            xstruct = self.structure_embedding(xinputs["structure"])
+            xpl = self.predicted_loop_embedding(xinputs["predicted_loop_type"])
+            xpairseq = self.sequence_embedding(xinputs["pair_sequence"])
+
+        # xembed = self.drop2(self.embed_norm(xinputs["sequence_embedding"]))
+        xseq = self.seq_conv(torch.cat([xseq, xpairseq, xpl, xstruct], dim=-1))
+        bs, seq_len = xseq.size()[:2]
+        xbpp_inp = xinputs["bpps"].permute(0, 3, 1, 2).contiguous()
+        xbpp = self.bpp_conv(xbpp_inp)
+        xbpp_mean = nn.AdaptiveAvgPool2d((seq_len, 1))(xbpp).squeeze(3).permute(0, 2, 1).contiguous()
+        xbpp_max = nn.AdaptiveMaxPool2d((seq_len, 1))(xbpp).squeeze(3).permute(0, 2, 1).contiguous()
+        #xbpp_pair = xbpp_mean.gather(xinputs["pair_sequence"], 1)
+        xseqbpp = self.transformer(xseq.permute(0, 2, 1).contiguous(), xbpp_inp).permute(0, 2, 1).contiguous()
+        cont_emb = torch.cat([xbpp_mean, xbpp_max], dim=-1)
+        x = torch.cat([xseq, xseqbpp, cont_emb], dim=-1)
+        x = self.pos(x)
+        x, _ = self.gru(x)
+        x = x[:, : self.max_seq_pred, :]
+        x = self.drop(x)
         x = self.fc(x)
         return x

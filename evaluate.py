@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 # from torchcontrib.optim import SWA
 
 from constants import FilePaths, TGT_COLS
-from datasets import RNAAugData
+from datasets import RNAAugDatav2
 from modellib import RNNmodels
 from nn_trainer import get_predictions, validation_metrics
 
@@ -43,7 +43,7 @@ if __name__ == "__main__":
     for fold in folds:
         val_idx = cvlist[fold][1]
         vl = train.iloc[val_idx]
-        vl_ds = RNAAugData(vl, targets=TGT_COLS)
+        vl_ds = RNAAugDatav2(vl, targets=TGT_COLS)
         vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
         model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModelv3"))(hparams)
         model.load_state_dict(torch.load(model_path / f"fold_{fold}" / "checkpoints/best.pth")["model_state_dict"])

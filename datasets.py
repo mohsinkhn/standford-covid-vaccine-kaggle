@@ -29,7 +29,9 @@ def match_pair(structure):
 
 
 class RNAAugData(Dataset):
-    def __init__(self, df, targets=None, target_aug=False, augment_strucures=False, aug_data_sources=None, bpps_path="data/bpps"):
+    def __init__(
+        self, df, targets=None, target_aug=False, augment_strucures=False, aug_data_sources=None, bpps_path="data/bpps"
+    ):
         self.df = df
         self.targets = targets
         self.num_targets = len(targets) if targets is not None else 3
@@ -113,4 +115,116 @@ class RNAAugData(Dataset):
             targets = targets.clip(-0.5, 100)
 
         inputs["bpps"] = np.load(f"{self.bpps_path}/{seq_id}.npy").astype("float32")
+        return inputs, targets
+
+
+class RNAAugDatav2(Dataset):
+    def __init__(
+        self, df, targets=None, target_aug=False, augment_strucures=False, aug_data_sources=None, bpps_path="data/bpps"
+    ):
+        self.df = df
+        self.targets = targets
+        self.num_targets = len(targets) if targets is not None else 3
+        self.bpps_path = bpps_path
+        self.target_aug = target_aug
+        self.augment_strucures = augment_strucures
+        self.aug_data_sources = aug_data_sources
+        self.aug_data = None
+        self.data = None
+        if self.augment_strucures:
+            self.aug_data = pd.concat([pd.read_csv(src) for src in aug_data_sources])
+            in_ids = set(self.df.id.values)
+            self.aug_data = self.aug_data.loc[self.aug_data.id.isin(in_ids)]
+            print(self.aug_data.head())
+        self.prepare_inputs()  # Tokenize stuff and keep as numpy array for quick batch loading
+
+    @staticmethod
+    def base_pair_index_to_sequence(df):  # From base pair index, get actual index
+        df["pair_sequence"] = df[["sequence", "pair_index"]].apply(
+            lambda x: [x["sequence"][idx] if idx >= 0 else "0" for idx in x["pair_index"]], axis=1
+        )
+        return df
+
+    def get_match_pairs(self):  # Get index of base pairs
+        self.df["pair_index"] = self.df["structure"].apply(lambda x: match_pair(x))
+        self.df = self.base_pair_index_to_sequence(self.df)
+        if self.aug_data is not None:
+            self.aug_data["pair_index"] = self.aug_data["structure"].apply(lambda x: match_pair(x))
+            self.aug_data = self.base_pair_index_to_sequence(self.aug_data)
+
+    def gather_data(self):
+        if self.aug_data is not None:
+            self.data = pd.concat([self.df, self.aug_data])
+            self.data = self.data.drop_duplicates(subset=["sequence", "structure"])
+        else:
+            self.data = self.df.copy()
+
+    def tokenize_symbols(self):
+        self.data["sequence"] = self.data["sequence"].apply(lambda x: [Mappings.sequence_token2int.get(token, 0) for token in x])
+        self.data["structure"] = self.data["structure"].apply(lambda x: [Mappings.structure_token2int.get(token, 0) for token in x])
+        self.data["predicted_loop_type"] = self.data["predicted_loop_type"].apply(lambda x: [Mappings.pl_token2int.get(token, 0) for token in x])
+        self.data["pair_sequence"] = self.data["pair_sequence"].apply(lambda x: [Mappings.sequence_token2int.get(token, 0) for token in x])
+
+    def prepare_inputs(self):
+        self.get_match_pairs()
+        self.gather_data()
+        self.tokenize_symbols()
+        self.sequence = self.data.groupby("id")["sequence"].apply(list).to_dict()
+        self.structure = self.data.groupby("id")["structure"].apply(list).to_dict()
+        self.predicted_loop = self.data.groupby("id")["predicted_loop_type"].apply(list).to_dict()
+        self.pair_sequence = self.data.groupby("id")["pair_sequence"].apply(list).to_dict()
+
+        self.ids = self.df["id"].unique()
+
+        if self.targets is not None:
+            target_arr = (
+                np.dstack((np.vstack(self.df[col].values) for col in self.targets)).astype(np.float32).clip(-4, 20)
+            )
+            self.target_values = {seq_id: arr for seq_id, arr in zip(self.df.id.values, target_arr)}
+
+        if self.target_aug:
+            errors_arr = (
+                np.dstack((np.vstack(self.df[TGT2ERR_COL[col]].values) for col in self.targets))
+                .astype(np.float32)
+                .clip(-4, 4)
+            )
+            self.errors_sigma = {seq_id: arr for seq_id, arr in zip(self.df.id.values, errors_arr)}
+
+    def get_bpps(self, seq_id):
+        b1 = [np.load(f"{self.bpps_path}/{seq_id}.npy").astype("float32")]
+        b2 = [np.load(f"data/vienna_2/bpps/{seq_id}_{T}.npy").astype("float32") for T in [7, 17, 27, 47, 57, 67]]
+        b3 = [np.load(f"data/nupack_95/bpps/{seq_id}_{T}.npy").astype("float32") for T in [7, 17, 27, 37, 47, 57, 67]]
+        b4 = [np.load(f"data/nupack_99/bpps/{seq_id}_{T}.npy").astype("float32") for T in [37]]
+        bpps = b1 + b2 + b3 + b4
+        return np.dstack(bpps)
+
+    def get_embeddings(self, seq_id):
+        return np.load(f"data/w2v_embeddings/{seq_id}.npy")
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        seq_id = self.ids[idx]
+        num_options = len(self.sequence[seq_id])
+        option_idx = np.random.choice(list(range(num_options)))
+        inputs = {
+            "sequence": np.array(self.sequence[seq_id][option_idx]),
+            "structure": np.array(self.structure[seq_id][option_idx]),
+            "predicted_loop_type": np.array(self.predicted_loop[seq_id][option_idx]),
+            "pair_sequence": np.array(self.pair_sequence[seq_id][option_idx]),
+            # "sequence_embedding": self.get_embeddings(seq_id)
+            # "pair_index": np.array(self.pair_sequence[seq_id][option_idx])
+        }
+        if self.targets is not None:
+            targets = self.target_values[seq_id].copy()
+        else:
+            targets = [0]
+
+        if self.target_aug:
+            err_sig = self.errors_sigma[seq_id]
+            err = (np.random.gamma(shape=1.2, scale=0.3, size=err_sig.shape) - 0.36) * err_sig
+            targets[:, : self.num_targets] += err
+
+        inputs["bpps"] = self.get_bpps(seq_id)
         return inputs, targets

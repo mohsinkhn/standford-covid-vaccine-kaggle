@@ -80,10 +80,10 @@ def node_feature_vec(sequence, struc, predicted_loop_type, bpps_row):
     ]
 
 
-def ploop_node_feature_vec(predicted_loop_type):
+def ploop_node_feature_vec(predicted_loop_type, pcnt):
     return [
         0,  # bp segment node
-        1,  # pl segment node
+        pcnt,  # pl segment node
         0,  # seq
         0,  # seq
         0,  # seq
@@ -97,15 +97,15 @@ def ploop_node_feature_vec(predicted_loop_type):
         predicted_loop_type == "X",
         0,
         0,
-        0,  # is paired
+        predicted_loop_type == "S",  # is paired
         0,  # seg pairs
     ]
 
 
 def pair_node_feature_vec(num_pairs):
     return [
-        0,  # bp segment node
-        1,  # pl segment node
+        1,  # bp segment node
+        0,  # pl segment node
         0,  # seq
         0,  # seq
         0,  # seq
@@ -119,7 +119,7 @@ def pair_node_feature_vec(num_pairs):
         0,
         0,
         0,
-        0,  # is paired
+        1,  # is paired
         num_pairs,  # seg pairs
     ]
 
@@ -136,11 +136,11 @@ def get_node_features(sequence, structure, predicted_loop_type, bpps, segment_bp
             continue
         node_features.append(pair_node_feature_vec(segment_pairs[bpidx] * 2 / len(sequence)))
 
-    segment_pl, pl_idx = np.unique(segment_pl_num.split("_"), return_index=True)
-    for plseg, plidx in zip(segment_pl, pl_idx):
+    segment_pl, pl_idx, pl_cnts = np.unique(segment_pl_num.split("_"), return_index=True, return_counts=True)
+    for plseg, plidx, plcnt in zip(segment_pl, pl_idx, pl_cnts):
         if plseg == "0":
             continue
-        node_features.append(ploop_node_feature_vec(predicted_loop_type[plidx]))
+        node_features.append(ploop_node_feature_vec(predicted_loop_type[plidx], plcnt/10))
 
     return node_features
 
@@ -152,7 +152,12 @@ def add_edges(edge_index, edge_features, node1, node2, feature1, feature2):
     edge_features.append(feature2)
 
 
-def add_edges_between_base_nodes(edge_index, edge_features, node1, node2):
+def add_edges_forward(edge_index, edge_features, node1, node2, feature1, feature2):
+    edge_index.append([node1, node2])
+    edge_features.append(feature1)
+
+
+def add_edges_between_base_nodes(edge_index, edge_features, node1, node2, bpps_np1, bpps_np2):
     edge_feature1 = [
         0,  # is edge for paired nodes
         0,  # is edge between bp node and non bp node
@@ -161,8 +166,8 @@ def add_edges_between_base_nodes(edge_index, edge_features, node1, node2):
         0,
         1,  # forward edge: 1, backward edge: -1
         0,  # forward or backward
-        1,  # bpps if edge is for paired nodes
-        0,  # non pairing prob
+        0,  # bpps if edge is for paired nodes
+        bpps_np1,  # non pairing prob
     ]
     edge_feature2 = [
         0,  # is edge for paired nodes
@@ -170,12 +175,13 @@ def add_edges_between_base_nodes(edge_index, edge_features, node1, node2):
         0,  # is edge between bp node and non bp node
         0,  # pl node
         0,
-        0,  # forward edge: 1, backward edge: -1
+        -1,  # forward edge: 1, backward edge: -1
         0,  # forward or backward
-        1,  # bpps if edge is for paired nodes
-        0,  # non pairing prob
+        0,  # bpps if edge is for paired nodes
+        bpps_np2,  # non pairing prob
     ]
     add_edges(edge_index, edge_features, node1, node2, edge_feature1, edge_feature2)
+    #add_edges_forward(edge_index, edge_features, node1, node2, edge_feature1, edge_feature2)
 
 
 def add_edges_between_paired_nodes(edge_index, edge_features, node1, node2, bpps, bpps_np1, bpps_np2):
@@ -239,7 +245,7 @@ def add_edges_between_pl_nodes(edge_index, edge_features, node1, node2):
         1,
         0,  # forward edge: 1, backward edge: -1
         0,  # forward or backward
-        1,  # bpps if edge is for paired nodes
+        0,  # bpps if edge is for paired nodes
         0
     ]
     edge_feature2 = [
@@ -250,7 +256,7 @@ def add_edges_between_pl_nodes(edge_index, edge_features, node1, node2):
         1,
         0,  # forward edge: 1, backward edge: -1
         0,  # forward or backward
-        1,  # bpps if edge is for paired nodes
+        0,  # bpps if edge is for paired nodes
         0
     ]
     add_edges(edge_index, edge_features, node1, node2, edge_feature1, edge_feature2)
@@ -265,7 +271,7 @@ def add_edges_between_pl_segments(edge_index, edge_features, node1, node2):
         0,
         0,  # forward edge: 1, backward edge: -1
         0,  # forward or backward
-        1,  # bpps if edge is for paired nodes
+        0,  # bpps if edge is for paired nodes
         0
     ]
     edge_feature2 = [
@@ -276,7 +282,7 @@ def add_edges_between_pl_segments(edge_index, edge_features, node1, node2):
         0,
         0,  # forward edge: 1, backward edge: -1
         0,  # forward or backward
-        1,  # bpps if edge is for paired nodes
+        0,  # bpps if edge is for paired nodes
         0
     ]
     add_edges(edge_index, edge_features, node1, node2, edge_feature1, edge_feature2)
@@ -305,12 +311,12 @@ def get_edge_index_features(
     edge_index = []
     edge_features = []
     for j in range(len(sequence) - 1):
-        add_edges_between_base_nodes(edge_index, edge_features, j, j + 1)
+        add_edges_between_base_nodes(edge_index, edge_features, j, j + 1, 1 - sum(bpps[j]), 1 - sum(bpps[j+1]))
 
     pairs = get_pairs(structure)
     for pp in pairs:
         i, j = pp
-        add_edges_between_paired_nodes(edge_index, edge_features, i, j, bpps[i, j], 1 - sum(bpps[i]), 1 - sum(bpps[i]))
+        add_edges_between_paired_nodes(edge_index, edge_features, i, j, bpps[i, j], 1 - sum(bpps[i]), 1 - sum(bpps[j]))
 
     segment_bp, seg_idx = np.unique(segment_bp_num.split("_"), return_inverse=True)
     node_cnt = len(sequence)

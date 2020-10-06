@@ -77,13 +77,13 @@ class SingleHeadStaticAttn(nn.Module):
         """
         shape of x: batch*num_feats/channel*seq_len : output of the conv layer can be directly fed into this
         """
-        xl = self.norm_layer1(x.permute(0, 2, 1).contiguous()).permute(0, 2, 1).contiguous()
-        attn_map = torch.softmax(attn_map, dim=1)
-        x_ = torch.bmm(xl, attn_map)
+        xl = self.norm_layer1(x)
+        # attn_map = torch.softmax(attn_map, dim=1)
+        x_ = torch.bmm(attn_map, xl.permute(1, 0, 2).contiguous()).permute(1, 0, 2).contiguous()
         x = x + self.dp(x_)
-        xl = self.norm_layer2(x.permute(0, 2, 1).contiguous())
+        xl = self.norm_layer2(x)
         x_ = self.ff(xl)
-        x = x + self.dp(x_.permute(0, 2, 1).contiguous())
+        x = x + self.dp(x_)
         return x
 
 
@@ -99,14 +99,14 @@ class MultiHeadStaticAttn(nn.Module):
         shape of x: batch*num_feats/channel*seq_len : output of the conv layer can be directly fed into this
         fixes_attns: batch*num_heads*seq_len*seq_len
         """
-        fixed_attns_ = self.attn_conv(fixed_attns)
-        num_heads = fixed_attns_.size(1)
+        fixed_attns = self.attn_conv(fixed_attns)
+        num_heads = fixed_attns.size(1)
         heads = []
         for i in range(num_heads):
-            head = self.singlehead(x, fixed_attns_[:, i, :, :])
+            head = self.singlehead(x, fixed_attns[:, i, :, :])
             heads.append(head)
-        multihead_concat = torch.cat(heads, 1)
-        return self.fc(multihead_concat.permute(0, 2, 1).contiguous()).permute(0, 2, 1).contiguous()
+        multihead_concat = torch.cat(heads, -1)
+        return self.fc(multihead_concat)
 
 
 class TransformerCustomEncoder(nn.Module):
@@ -133,7 +133,7 @@ class TransformerCustomEncoder(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=500):
+    def __init__(self, d_model, dropout=0.1, max_len=2000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
 
@@ -146,4 +146,61 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x):
-        return torch.cat([x, self.pe[: x.size(1), :].permute(1, 0, 2).contiguous().repeat(x.size(0), 1, 1)], dim=-1)
+        return x + self.pe[:x.size(0), :]  # .repeat(1, x.size(1), 1)], dim=-1)
+
+
+class CustomTransformerEncoderLayer(nn.Module):
+    r"""TransformerEncoderLayer is made up of self-attn and feedforward network.
+    This standard encoder layer is based on the paper "Attention Is All You Need".
+    Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+    Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. In Advances in
+    Neural Information Processing Systems, pages 6000-6010. Users may modify or implement
+    in a different way during application.
+
+    Args:
+        d_model: the number of expected features in the input (required).
+        nhead: the number of heads in the multiheadattention models (required).
+        dim_feedforward: the dimension of the feedforward network model (default=2048).
+        dropout: the dropout value (default=0.1).
+        activation: the activation function of intermediate layer, relu or gelu (default=relu).
+
+    Examples::
+        >>> encoder_layer = nn.TransformerEncoderLayer(d_model=512, nhead=8)
+        >>> src = torch.rand(10, 32, 512)
+        >>> out = encoder_layer(src)
+    """
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
+        super(CustomTransformerEncoderLayer, self).__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = nn.ReLU()
+
+    def forward(self, src, src_mask = None, src_key_padding_mask = None):
+        r"""Pass the input through the encoder layer.
+
+        Args:
+            src: the sequence to the encoder layer (required).
+            src_mask: the mask for the src sequence (optional).
+            src_key_padding_mask: the mask for the src keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        src = self.norm1(src)
+        src2 = self.self_attn(src, src, src)[0]
+        src = src + self.dropout1(src2)
+        src = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        # src = self.norm2(src)
+        return src

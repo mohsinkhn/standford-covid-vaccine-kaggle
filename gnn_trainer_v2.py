@@ -144,7 +144,7 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
                    # dl.OptimizerCallback(metric_key="loss")
                 ],
         load_best_on_end=True,
-        # resume="logs/filter__cnnlstm__posembv5/fold_0/checkpoints/best_full.pth"
+        # resume="logs/gcn__transformer__hypernode__run3/fold_4/checkpoints/best_full.pth"
     )
     return model, tr_dl, vl_dl
 

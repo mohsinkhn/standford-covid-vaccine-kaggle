@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-
 from catalyst import dl
 from catalyst.dl import utils
 from catalyst.core.callbacks.scheduler import SchedulerCallback
@@ -22,6 +21,9 @@ from tqdm import tqdm
 from constants import FilePaths, TGT_COLS
 from datasets import RNAAugData, RNAAugDatav2
 from modellib import RNNmodels
+
+
+os.environ["CUDA_LAUNCH_BLOCKING"]="1"
 
 
 def calc_error_mean(row):
@@ -88,22 +90,33 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
         aug_data_sources=[
                           #"data/augmented_data_public/aug_data5.csv",
                           #"data/augmented_data_public/aug_data5_10.csv",
-                          # "data/vienna_7_mec.csv", 
-                          "data/vienna_17_mec.csv", 
+                          #"data/vienna_7_mec.csv", 
+                          #"data/vienna_17_mec.csv", 
                           "data/vienna_27_mec.csv",
                           "data/vienna_47_mec.csv",
-                           "data/vienna_57_mec.csv",
-                            "data/vienna_67_mec.csv"
+                          #"data/vienna_57_mec.csv",
+                          #"data/vienna_67_mec.csv"
                            ],
-        target_aug=False,
+        target_aug=True,
         bpps_path="data/bpps",
+        add_segment_info=hparams.get("add_segment_info", False),
+        add_entropy=hparams.get("add_entropy", False),
+        use_6n=hparams.get("use_6n", False)
     )
-    vl_ds = RNAAugDatav2(vl, targets=TGT_COLS, bpps_path="data/bpps")
+    vl_ds = RNAAugDatav2(vl, targets=TGT_COLS, bpps_path="data/bpps", add_segment_info=hparams.get("add_segment_info", False), 
+    add_entropy=hparams.get("add_entropy", False), use_6n=hparams.get("use_6n", False)
+)
 
     tr_dl = DataLoader(tr_ds, shuffle=True, drop_last=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,)
     vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,)
 
-    model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams)
+    if hparams.get("model_name") == "PretrainedTransformer":
+        bpp_model = RNNmodels.BPPSModel(hparams)
+        bpp_model.load_state_dict(torch.load("logs/embed__using__bppv2/fold_19/checkpoints/best.pth")['model_state_dict'])
+        bpp_model.to(device)
+        model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams, bpp_model)
+    else:
+        model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams)
     if hparams.get("optimizer", "adam") == "adam":
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=False,
@@ -216,10 +229,10 @@ if __name__ == "__main__":
         tr_idx, val_idx = cvlist[fold_num]
         tr, vl = train.iloc[tr_idx], train.iloc[val_idx]
         if hparams.get("filter_sn"):
-            # tr = tr.loc[tr["signal_to_noise"] > hparams.get("signal_to_noise", 1.0)]
-            # vl = vl.loc[vl["signal_to_noise"] > hparams.get("signal_to_noise", 1.0)]
-            tr = tr.loc[tr.apply(calc_error_mean, axis=1) < 0.5]
-            vl = vl.loc[vl.apply(calc_error_mean, axis=1) < 0.5]
+            tr = tr.loc[tr["signal_to_noise"] > hparams.get("signal_to_noise", 1.0)]
+            vl = vl.loc[vl["signal_to_noise"] > hparams.get("signal_to_noise", 1.0)]
+            # tr = tr.loc[tr.apply(calc_error_mean, axis=1) <= 0.5]
+            # vl = vl.loc[vl.apply(calc_error_mean, axis=1) <= 0.5]
         logdir = exp_dir / f"fold_{fold_num}"
         logdir.mkdir(exist_ok=True)
         neptune_logger = NeptuneLogger(
@@ -231,7 +244,9 @@ if __name__ == "__main__":
             upload_source_files=["*.py", "modellib/*.py"],
         )
         trained_model, _, vl_dl = train_one_fold(tr, vl, hparams, neptune_logger, logdir, device)
-        vds = RNAAugDatav2(train.iloc[val_idx], targets=TGT_COLS, bpps_path="data/bpps")
+        vds = RNAAugDatav2(train.iloc[val_idx], targets=TGT_COLS, bpps_path="data/bpps",
+         add_segment_info=hparams.get("add_segment_info", False),
+                 add_entropy=hparams.get("add_entropy", False), use_6n=hparams.get("use_6n", False))
         vdl = DataLoader(vds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,)
         val_pred = get_predictions(trained_model, vdl, device)[:, :, : hparams["num_features"]]
         val_preds[val_idx] = val_pred

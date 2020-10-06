@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from torch.nn import Linear, LayerNorm, Dropout, TransformerEncoderLayer, TransformerEncoder
 from torch_geometric.nn import ChebConv, NNConv, DeepGCNLayer, EdgeConv, GENConv, DNAConv
+from torch_geometric.nn import MessagePassing
 
 
 class MapE2NxN(torch.nn.Module):
@@ -64,7 +65,7 @@ class ParamsModule(nn.Module):
         self.hidden_channels3 = hparams.get("hidden_channels3", 0.1)
         self.num_classes = hparams.get("num_classes", 3)
         self.seq_len = hparams.get("seq_len", 107)
-        self.pos_channels = hparams.get("pos_channels", 32)
+        self.pos_channels = hparams.get("pos_channels", 64)
         self.transformer_layers = hparams.get("transformer_layers", 3)
         self.transformer_heads = hparams.get("transformer_heads", 8)
         self.transformer_hidden = hparams.get("transformer_hidden", 256)
@@ -106,6 +107,9 @@ class HyperNodeGCN(ParamsModule):
 
             layer = DeepGCNLayer(conv, norm, act, block="res+", dropout=self.dropout1, ckpt_grad=False)
             self.layers.append(layer)
+            #if i % 10 == 0:
+            #    self.layer2 = MPNN_v1(self.transformer_hidden, self.node_hidden_channels, self.edge_hidden_channels)
+            #    self.layers.append(layer2)
 
         self.position = PositionEncode(self.pos_channels)
         self.encoder = TransformerEncoder(
@@ -119,7 +123,7 @@ class HyperNodeGCN(ParamsModule):
         )
         self.lin = Linear(self.node_hidden_channels + self.pos_channels, self.num_classes)
         self.dropout = Dropout(self.dropout2)
-        self.dnaconv = DNAConv(self.node_hidden_channels, 2, dropout=0.1)
+        # self.dnaconv = DNAConv(self.node_hidden_channels, 2, dropout=0.1)
 
     def forward(self, data):
         x = data.x
@@ -129,13 +133,16 @@ class HyperNodeGCN(ParamsModule):
 
         # edge for paired nodes are excluded for encoding node
         seq_edge_index = edge_index[:, edge_attr[:, 0] == 0]
-        x = self.node_encoder(x , seq_edge_index)
+        x = self.node_encoder(x, seq_edge_index)
 
         edge_attr = self.edge_encoder(edge_attr)
 
         x = self.layers[0].conv(x, edge_index, edge_attr)
 
-        for layer in self.layers[1:]:
+        for i, layer in enumerate(self.layers[1:]):
+            # if (i + 1) % 10 == 0:
+            #     x, edge_attr = self.layer2(x, edge_index, edge_attr)
+            # else:
             x = layer(x, edge_index, edge_attr)
 
         x = self.layers[0].act(self.layers[0].norm(x))
@@ -158,6 +165,82 @@ class HyperNodeGCN(ParamsModule):
         #     xi = xi[:, :self.seq_len, :]
         #     out.append(xi)
         # return torch.cat(out, 0)
+
+
+class EdgeUpdate(nn.Module):
+    """
+    Edge update module, takes two vertices and the edge between to update the edge  
+    """
+
+    def __init__(self, hidden_dim, node_state_dim, edge_state_dim):
+        super().__init__()
+
+        self.MLP = nn.Sequential(
+            *[
+                nn.Linear(2 * node_state_dim + edge_state_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, edge_state_dim),
+                # nn.GELU()
+            ]
+        )
+
+    def forward(self, x_i, x_j, e):
+        x = torch.cat([x_i, x_j, e], axis=-1)
+        return self.MLP(x)
+
+
+class NodeMessage(nn.Module):
+    def __init__(self, hidden_dim, node_state_dim, edge_state_dim):
+        super().__init__()
+        self.MLP = nn.Sequential(
+            *[
+                nn.Linear(2 * node_state_dim + edge_state_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, node_state_dim),
+                # nn.GELU()
+            ]
+        )
+
+    def forward(self, x_i, x_j, e):
+        x = torch.cat([x_i, x_j, e], axis=-1)
+        return self.MLP(x)
+
+
+class NodeUpdate(nn.Module):
+    def __init__(self, hidden_dim, node_state_dim):
+        super().__init__()
+        self.MLP = nn.Sequential(
+            *[nn.Linear(2 * node_state_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, node_state_dim)]
+        )
+
+    def forward(self, x_i, aggr_output):
+        """
+        here aggr_output is the aggregation of the messages from the neighbouring nodes 
+        """
+        x = torch.cat([x_i, aggr_output], axis=-1)
+        return x_i + self.MLP(x)  ### added a skip connection within the message update layer
+
+
+class MPNN_v1(MessagePassing):
+    def __init__(self, hidden_dim, node_state_dim, edge_state_dim, dropout=0.2):
+        super().__init__()
+        self.nodemessage = NodeMessage(hidden_dim, node_state_dim, edge_state_dim,)
+        self.nodeupdate = NodeUpdate(hidden_dim, node_state_dim)
+        self.edgeupdate = EdgeUpdate(hidden_dim, node_state_dim, edge_state_dim)
+        self.bn_dp_n = nn.Sequential(*[nn.LayerNorm(node_state_dim), nn.Dropout(dropout), nn.GELU()])
+        self.bn_dp_e = nn.Sequential(*[nn.LayerNorm(edge_state_dim), nn.Dropout(dropout), nn.GELU()])
+
+    def forward(self, node_feats, edge_index, edge_feats):
+        src, dst = edge_index
+        edge_feats = self.edgeupdate(node_feats[src], node_feats[dst], edge_feats)
+        agg_val = self.propagate(x=node_feats, edge_index=edge_index, edge_feats=edge_feats)
+        new_state = self.nodeupdate(node_feats, agg_val)
+        new_state = self.bn_dp_n(new_state)
+        edge_feats = self.bn_dp_e(edge_feats)
+        return new_state, edge_feats
+
+    def message(self, x_i, x_j, edge_index, edge_feats):
+        return self.nodemessage(x_i, x_j, edge_feats)
 
 
 class GTN(nn.Module):

@@ -380,4 +380,4 @@ class BPPSData(Dataset):
             "predicted_loop_type": np.array(self.predicted_loop[idx]),
             "pair_sequence": np.array(self.pair_sequence[idx])
         }
-        return inputs, np.array(self.predicted_loop[idx])  # np.array(self.targets[idx]).reshape(-1, 1)
+        return inputs, inputs  # np.array(self.targets[idx]).reshape(-1, 1)

@@ -133,6 +133,7 @@ class TransformerCustomEncoder(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
+
     def __init__(self, d_model, dropout=0.1, max_len=2000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
@@ -143,10 +144,11 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer("pe", pe)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        return x + self.pe[:x.size(0), :]  # .repeat(1, x.size(1), 1)], dim=-1)
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
 
 
 class CustomTransformerEncoderLayer(nn.Module):

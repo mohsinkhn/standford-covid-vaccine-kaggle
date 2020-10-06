@@ -16,12 +16,60 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
+import torch
+import torch.nn.functional as F
 # from torchcontrib.optim import SWA
 
-from constants import FilePaths, TGT_COLS
+from constants import FilePaths, TGT_COLS, Mappings
 from datasets import BPPSData
 from modellib import RNNmodels
+
+
+class VAELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, recon_x, x, mu, logvar):
+        if isinstance(recon_x, list):
+            BCE = 0
+            for recon_x_one in recon_x:
+                BCE += F.mse_loss(recon_x_one, x)  # F.binary_cross_entropy_with_logits(recon_x_one, x)
+            BCE /= len(recon_x)
+        else:
+            BCE = F.mse_loss(recon_x, x)  # F.binary_cross_entropy_with_logits(recon_x, x)
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        KLD /= BATCH_SIZE * 128
+        return BCE + 1e-5 * KLD
+
+def onehot(sequence, num_tokens):
+    bs, seq_len = sequence.size()[:2]
+    y_onehot = torch.FloatTensor(bs, seq_len, num_tokens).to(sequence.device)
+    y_onehot.zero_()
+    y_onehot.scatter_(2, sequence.unsqueeze(2), 1)
+    return y_onehot
+
+
+class CustomRunner(dl.Runner):
+    def _handle_batch(self, batch):
+        x, y = batch
+        num_seq_tokens = len(Mappings.sequence_token2int.keys()) + 1
+        num_struct_tokens = len(Mappings.structure_token2int.keys()) + 1
+        num_pl_tokens = len(Mappings.pl_token2int.keys()) + 1
+        xseq = onehot(x["sequence"], num_seq_tokens)
+        xstruct = onehot(x["structure"], num_struct_tokens)
+        xpl = onehot(x["predicted_loop_type"], num_pl_tokens)
+        x = torch.cat([xseq, xstruct, xpl], -1)
+        recon_x, mu, logvar = self.model(x)
+        loss = self.criterion(recon_x, x, mu, logvar)
+        batch_metrics = {"loss": loss}
+
+        if self.is_train_loader:
+            loss.backward()
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+        # self.input["targets"] = y
+        self.output = recon_x
+        self.batch_metrics.update(**batch_metrics)
 
 
 def train_one_fold(tr, vl, hparams, logger, logdir, device):
@@ -33,7 +81,7 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
     tr_dl = DataLoader(tr_ds, shuffle=True, drop_last=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,)
     vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,)
 
-    model = RNNmodels.BPPSModel(hparams)
+    model = RNNmodels.SequenceEncoder(hparams)
     if hparams.get("optimizer", "adam") == "adam":
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=False,
@@ -47,7 +95,7 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
             nesterov=True,
         )
     if hparams.get("scheduler", "reducelrplateau") == "reducelrplateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, factor=0.5, min_lr=2e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, factor=0.5, min_lr=1e-3)
     if hparams.get("scheduler", "reducelrplateau") == "onecycle":
         total_steps = hparams.get("num_epochs") * (len(tr) // hparams.get("batch_size"))
         max_lr = hparams.get("lr", 1e-3)
@@ -55,8 +103,8 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
             optimizer, num_steps=total_steps, lr_range=(max_lr, max_lr / 10, max_lr / 100), warmup_fraction=0.5,
         )
 
-    criterion = nn.BCEWithLogitsLoss()
-    runner = dl.SupervisedRunner(device=device)
+    criterion = VAELoss()
+    runner = CustomRunner(device=device)
     runner.train(
         loaders={"train": tr_dl, "valid": vl_dl},
         model=model,
@@ -103,7 +151,7 @@ if __name__ == "__main__":
     val_preds = np.zeros(shape=(len(train), hparams["max_seq_pred"], hparams["num_features"]), dtype="float64",)
     for fold_num in [m-1]:
         tr_idx, val_idx = cvlist[fold_num]
-        tr, vl = data.iloc[tr_idx], data.iloc[val_idx]
+        tr, vl = data, data.iloc[val_idx]
         logdir = exp_dir / f"fold_{fold_num}"
         logdir.mkdir(exist_ok=True)
         neptune_logger = NeptuneLogger(

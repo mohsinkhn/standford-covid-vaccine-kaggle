@@ -6,6 +6,8 @@ from gensim.models import KeyedVectors
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
+from torch.autograd import Variable
 
 from constants import Mappings
 from modellib.transformermodels import CustomTransformerEncoderLayer, PositionalEncoding
@@ -97,7 +99,7 @@ class Conv1dBnStack(nn.Module):
                 out_channels=self.conv_channels[i],
                 stride=stride,
                 kernel_size=kernel_size,
-                drop=0.2,
+                drop=drop,
                 padding=padding,
                 groups=groups[i]
             )
@@ -152,6 +154,7 @@ class ParamModel(nn.Module):
         self.add_segment_info = self.hparams.get("add_segment_info", False)
         self.add_entropy = self.hparams.get("add_entropy", False)
         self.use_6n = self.hparams.get("use_6n", False)
+        self.adaptive_lr = self.hparams.get("adaptive_lr", False)
 
 
 class RNAGRUModel(ParamModel):
@@ -603,36 +606,85 @@ class RCNNGRUModelv7(ParamModel):
         return x
 
 
-class BPPSModel(ParamModel):
+class SequenceEncoder(ParamModel):
     def __init__(self, hparams):
         super().__init__(hparams)
         self.hparams = hparams
-        conv_input = self.num_seq_tokens * 2 + self.num_pl_tokens + self.num_struct_tokens
-        self.seq_conv = Conv1dBnStack(conv_input, self.conv_channels, groups=1, kernel_size=5, padding=2)
+        conv_input = self.num_seq_tokens + self.num_pl_tokens + self.num_struct_tokens
+        self.seq_conv = Conv1dBnStack(conv_input, self.conv_channels, groups=1, kernel_size=5, padding=2, drop=0.1)
         self.inp_shape = self.conv_channels[-1]
-        self.pos = PositionalEncoding(self.inp_shape)
+        self.pos1 = PositionalEncoding(self.inp_shape)
+        self.pos2 = PositionalEncoding(128)
+
         self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(self.inp_shape, 2, 1024, 0.1), 3)
-        self.drop = nn.Dropout(self.spatial_dropout)
-        self.fc = nn.Linear(self.inp_shape, 1)
+            nn.TransformerEncoderLayer(self.inp_shape, 2, 256, 0.1), 2)
+        self.decoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(128, 2, 256, 0.1), 2)
+        self.sdrop = SpatialDropout(0.2)
+        self.drop = nn.Dropout(0.1)
+        self.fcs = nn.Linear(self.inp_shape, self.inp_shape)
+        self.fc11 = nn.Linear(self.inp_shape, 128)
+        self.fc12 = nn.Linear(self.inp_shape, 128)
 
-    def get_transformed_input(self, xinputs):
-        xseq = onehot(xinputs["sequence"], self.num_seq_tokens)
-        xstruct = onehot(xinputs["structure"], self.num_struct_tokens)
-        xpl = onehot(xinputs["predicted_loop_type"], self.num_pl_tokens)
-        xpairseq = onehot(xinputs["pair_sequence"], self.num_seq_tokens)        
-        x = self.seq_conv(torch.cat([xseq, xpl, xstruct, xpairseq], -1))
+        self.fc = nn.Linear(128, conv_input)
+
+    def encode(self, x):
+        # xpairseq = onehot(xinputs["pair_sequence"], self.num_seq_tokens)        
+        x = self.seq_conv(x)
+        # x = self.sdrop(x)
         x = x.permute(1, 0, 2).contiguous()
-        x = self.pos(x)
+        x = self.pos1(x)
         x = self.transformer(x).permute(1, 0, 2).contiguous()
-        return x
+        # x = self.sdrop(x)
+        x1 = self.fcs(x)
+        x1 = torch.softmax(x1, dim=1)
+        xx = torch.sum(x * x1, dim=1)
+        # xx = torch.mean(x, dim=1)
+        mu_z = self.fc11(xx)
 
-    def forward(self, xinputs):
-        x = self.get_transformed_input(xinputs)
-        # x = x[:, : self.max_seq_pred, :]
-        x = self.drop(x)
-        x = self.fc(x)
-        return x
+        logvar_z = self.fc12(xx)
+        return x, mu_z, logvar_z
+
+    def reparameterize(self, mu: Variable, logvar: Variable) -> Variable:
+        if self.training:
+            # multiply log variance with 0.5, then in-place exponent
+            # yielding the standard deviation
+            sample_z = []
+            for _ in range(10):
+                std = logvar.mul(0.5).exp_()  # type: Variable
+                eps = Variable(std.data.new(std.size()).normal_())
+                sample_z.append(eps.mul(std).add_(mu))
+
+            return sample_z
+        else:
+            # During inference, we simply spit out the mean of the
+            # learned distribution for the current input.  We could
+            # use a random sample from the distribution, but mu of
+            # course has the highest probability.
+            return mu
+
+    def decode(self, z, seq_len):
+        # bs, seq_len = x.size()[:2]
+        z = z.unsqueeze(1).repeat(1, seq_len, 1)
+        # x = torch.cat([])
+        z = z.permute(1, 0, 2).contiguous()
+        z = self.pos2(z)
+        z = self.decoder(z)
+        z = z.permute(1, 0, 2).contiguous()
+        z = self.fc(z)
+        return z
+
+    def forward(self, x: Variable) -> (Variable, Variable, Variable):
+        xx, mu, logvar = self.encode(x)
+        bs, seq_len = x.size()[:2]
+        # print(mu.shape, logvar.shape)
+        z = self.reparameterize(mu, logvar)
+        # print(z[0].shape)
+        # print(self.decode(z[0]).shape)
+        if self.training:
+            return [self.decode(z, seq_len) for z in z], mu, logvar
+        else:
+            return self.decode(z, seq_len), mu, logvar
+        # return self.decode(z), mu, logvar
 
 
 class PretrainedTransformer(ParamModel):
@@ -645,11 +697,22 @@ class PretrainedTransformer(ParamModel):
         self.bpp_encoder = nn.Sequential(
             *[Conv2dBn(bpp_conv_channels[i], bpp_conv_channels[i + 1], kernel_size=1, padding=0) for i in range(len(bpp_conv_channels) - 1)]
         )
-        inp_shape = self.seq_encoder.inp_shape + self.bpp_conv_channels[-1] * 2
-        self.drop = nn.Dropout(self.spatial_dropout)
+        inp_shape = 128 + self.conv_channels[-1] + 17*2 + self.bpp_conv_channels[-1] * 2
+        self.drop = nn.Dropout(0.0)
+        self.sig = nn.Sigmoid()
+        self.pos = PositionalEncoding(inp_shape)
         self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(inp_shape, 2, 1024, 0.1), 2)
-        self.fc = nn.Linear(inp_shape, self.target_dim)
+            nn.TransformerEncoderLayer(inp_shape, 2, 256, 0.1), 2)
+        # self.transformer = nn.LSTM(inp_shape, inp_shape, bidirectional=True, num_layers=2, dropout=0.1)
+        self.gru = nn.LSTM(
+            input_size=inp_shape,
+            hidden_size=self.gru_dim,
+            bidirectional=self.bidirectional,
+            batch_first=True,
+            num_layers=self.gru_layers,
+            dropout=self.dropout_prob,
+        )
+        self.fc = nn.Linear(self.gru_dim * (1 + self.bidirectional), self.target_dim)
 
     def get_bpp_features(self, x, seq_len):
         xbpp_conv = self.bpp_encoder(x[:, :, :, :7].permute(0, 3, 1, 2).contiguous())
@@ -659,13 +722,25 @@ class PretrainedTransformer(ParamModel):
         return xbpp_emb
 
     def forward(self, xinputs):
+        xseq = onehot(xinputs["sequence"], self.num_seq_tokens)
+        xstruct = onehot(xinputs["structure"], self.num_struct_tokens)
+        xpl = onehot(xinputs["predicted_loop_type"], self.num_pl_tokens)
+        x = torch.cat([xseq, xstruct, xpl], -1)
         # self.bpp_model.to(xinputs["sequence"].device)
-        x = self.seq_encoder.get_transformed_input(xinputs)
         bs, seq_len = x.size()[:2]
+        xx, z, _ = self.seq_encoder.encode(x)
+        z2 = self.seq_encoder.decode(z, seq_len)
+
+        z = z.unsqueeze(1).repeat(1, seq_len, 1)
         xbpp = xinputs["bpps"]
         xbpp_emb = self.get_bpp_features(xbpp, seq_len)
-        x = torch.cat([x, xbpp_emb], -1)
-        x = self.transformer(x.transpose(0, 1)).transpose(0, 1)
+        # b = torch.ones(bs, seq_len, 1, device=xseq.device)
+        x = torch.cat([x, xbpp_emb, z, z2, xx], -1)
+        #x = x.permute(1, 0, 2).contiguous()
+        #x = self.pos(x)
+        #x = self.transformer(x).contiguous()
+        #x = x.permute(1, 0, 2).contiguous()
+        x, _ = self.gru(x)
         x = x[:, : self.max_seq_pred, :]
         x = self.fc(self.drop(x))
         return x

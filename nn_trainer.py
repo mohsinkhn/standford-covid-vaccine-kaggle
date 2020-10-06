@@ -111,16 +111,25 @@ def train_one_fold(tr, vl, hparams, logger, logdir, device):
     vl_dl = DataLoader(vl_ds, shuffle=False, drop_last=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,)
 
     if hparams.get("model_name") == "PretrainedTransformer":
-        bpp_model = RNNmodels.BPPSModel(hparams)
+        bpp_model = RNNmodels.SequenceEncoder(hparams)
         bpp_model.load_state_dict(torch.load("logs/embed__using__bppv2/fold_19/checkpoints/best.pth")['model_state_dict'])
         bpp_model.to(device)
         model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams, bpp_model)
     else:
         model = getattr(RNNmodels, hparams.get("model_name", "RNAGRUModel"))(hparams)
     if hparams.get("optimizer", "adam") == "adam":
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=False,
-        )
+        if hparams.get("adaptive_lr", False):
+            
+            optimizer = torch.optim.AdamW(
+                [
+                {'params': [params for name, params in model.named_parameters() if not name.startswith('seq_encoder')]},
+                {'params': model.seq_encoder.parameters(), 'lr': hparams.get("lr", 1e-3)//2}
+            ], lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=False,
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=hparams.get("lr", 1e-3), weight_decay=hparams.get("wd", 0), amsgrad=False,
+            )
     else:
         optimizer = torch.optim.SGD(
             model.parameters(),
